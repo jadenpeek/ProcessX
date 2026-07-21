@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/processx.png" alt="ProcessX logo" width="160">
+</p>
+
 # ProcessX
 
 A lightweight Windows tool for managing per-process CPU priority, I/O priority, and CPU affinity — with automatic detection of Intel P-core/E-core and AMD CCD topology, so you can isolate processes to the right cores with one click.
