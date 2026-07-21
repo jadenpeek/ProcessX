@@ -6,7 +6,8 @@ A lightweight Windows tool for managing per-process CPU priority, I/O priority, 
 
 - **CPU Priority** — set Idle / Below Normal / Normal / Above Normal / High / Realtime per process
 - **I/O Priority** — set Very Low / Low / Normal / High per process
-- **CPU affinity (CPU sets)** — pick exactly which logical CPUs a process is allowed to run on (CPU Sets work with all known anti-cheat systems, including Easy Anti-Cheat.)
+- **CPU affinity (CPU sets)** — pick exactly which logical CPUs a process is allowed to run on
+(CPU Sets work with all known anti-cheat systems, including Easy Anti-Cheat.)
 - **Topology-aware quick presets**
   - Intel hybrid CPUs: one-click "E-Cores Off" / "P-Cores Off"
   - AMD CPUs with two CCDs: one-click "CCD0 Off" / "CCD1 Off"
@@ -24,6 +25,8 @@ A lightweight Windows tool for managing per-process CPU priority, I/O priority, 
 ## Download
 
 Grab the latest `ProcessX.exe` from the [Releases](../../releases) page. No installation, no Python, no dependencies — download and run.
+
+> **Note:** The exe is unsigned, so Windows SmartScreen and some antivirus tools may flag it on first run ("Windows protected your PC" or a false-positive malware warning). This is common for small unsigned utilities, especially ones that touch process priority/affinity via `ctypes` — behavior that looks similar to what actual malware does. If SmartScreen blocks it, click **"More info" → "Run anyway"**. If you'd rather not trust a prebuilt binary, you can always [build it yourself from source](#building-from-source).
 
 ## Usage
 
