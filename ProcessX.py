@@ -2084,6 +2084,21 @@ class EditorDialog(tk.Toplevel):
             for i, v in enumerate(self.aff_vars):
                 v.set(i % 2 == 0)
 
+        def _ht_on():
+            for v in self.aff_vars:
+                v.set(True)
+
+        def _ht_off():
+            # P-core threads come in pairs (even index = thread 0, odd = thread 1
+            # of the same physical core); E-cores have no second thread, so they
+            # stay fully enabled regardless of HT state.
+            e_start = CPU_TOPOLOGY["e_thread_start"]
+            for i, v in enumerate(self.aff_vars):
+                if e_start > 0 and i >= e_start:
+                    v.set(True)
+                else:
+                    v.set(i % 2 == 0)
+
         def _disable_ccd1():
 
 
@@ -2137,7 +2152,11 @@ class EditorDialog(tk.Toplevel):
                 ("SMT On",  _smt_on),
                 ("SMT Off", _smt_off),
             ]
-
+        elif topo["vendor"] == "intel" and topo.get("ht_enabled", True):
+            quick_buttons += [
+                ("HT On",  _ht_on),
+                ("HT Off", _ht_off),
+            ]
 
         if topo["vendor"] == "amd" and topo["has_ccd1"]:
             quick_buttons.append(("CCD1 Off", _disable_ccd1))
