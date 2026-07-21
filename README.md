@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/processx.png" alt="ProcessX logo" width="160">
+  <img src="assets/processx.png" alt="ProcessX logo" width="280">
 </p>
 
 # ProcessX
