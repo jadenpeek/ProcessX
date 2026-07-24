@@ -1435,11 +1435,14 @@ class ProcessX(tk.Tk):
                     name = (info["name"] or "").strip()
                     if not name:
                         continue
-                    # Working-set RSS instead of USS: USS requires an extra
-                    # per-process page-walk query and is the single most
-                    # expensive call in this loop for negligible display
-                    # benefit over plain RSS at a 2s refresh cadence.
-                    ram = info["memory_info"].rss if info["memory_info"] else 0
+                    # Task Manager's "Memory" column reports the process's
+                    # private working set (USS), not raw RSS. USS costs an
+                    # extra per-process page-walk query, but matches what
+                    # users expect to see compared against Task Manager.
+                    try:
+                        ram = p.memory_full_info().uss
+                    except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                        ram = info["memory_info"].rss if info["memory_info"] else 0
                     nice = info["nice"]
                     # "System Idle Process" is a bookkeeping placeholder, not a real
                     if name.lower() == "system idle process":
