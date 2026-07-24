@@ -402,7 +402,8 @@ def _detect_cpu_topology() -> dict:
 CPU_TOPOLOGY = _detect_cpu_topology()
 
 
-_watcher_status_cb = None
+_watcher_status_cb  = None
+_watcher_refresh_cb = None
 _watcher_lock      = threading.Lock()
 
 def _rule_watcher_loop(get_rules_fn):
@@ -460,6 +461,12 @@ def _rule_watcher_loop(get_rules_fn):
                     msg = "Auto-applied: " + ", ".join(sorted(set(newly_applied)))
                     try:
                         _watcher_status_cb(msg)
+                    except Exception:
+                        pass
+
+                if newly_applied and _watcher_refresh_cb:
+                    try:
+                        _watcher_refresh_cb()
                     except Exception:
                         pass
         except Exception:
@@ -906,6 +913,37 @@ def _write_ico(png_bytes: bytes, path: Path):
     path.write_bytes(header + entry + png_bytes)
 
 
+def _win_toplevel_hwnd(win):
+    # Same HWND-resolution trick as ProcessX._toplevel_hwnd, but usable on
+    # any Tk widget (Toplevel dialogs included), not just the main window.
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        hwnd   = win.winfo_id()
+        parent = user32.GetParent(hwnd)
+        return parent if parent else hwnd
+    except Exception:
+        return win.winfo_id()
+
+def _win_enable_dark_titlebar(win):
+    # Tell DWM this window uses a dark theme. Call after win.update_idletasks()
+    # so the real HWND already exists. Works for the main window and for any
+    # Toplevel dialog (Rules window, rule editor, Add Rule prompt, etc).
+    try:
+        hwnd = _win_toplevel_hwnd(win)
+        value = ctypes.c_int(1)
+        for attr in (20, 19):  # 20 = current attr id, 19 = older Win10 builds
+            res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attr, ctypes.byref(value), ctypes.sizeof(value))
+            if res == 0:
+                break
+        DWMWA_TRANSITIONS_FORCEDISABLED = 3
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
+            ctypes.byref(value), ctypes.sizeof(value))
+    except Exception:
+        pass
+
+
 class ProcessX(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -941,8 +979,9 @@ class ProcessX(tk.Tk):
         self._sort_rev = False
 
 
-        global _watcher_status_cb
-        _watcher_status_cb = lambda msg: self.after(0, lambda m=msg: self.status_var.set(m))
+        global _watcher_status_cb, _watcher_refresh_cb
+        _watcher_status_cb  = lambda msg: self.after(0, lambda m=msg: self.status_var.set(m))
+        _watcher_refresh_cb = self._on_watcher_rule_applied
         self._watcher_thread = threading.Thread(
             target=_rule_watcher_loop,
             args=(lambda: self.rules,),
@@ -963,31 +1002,10 @@ class ProcessX(tk.Tk):
             self.deiconify()
 
     def _toplevel_hwnd(self):
-        # Tk on Windows actually creates two HWNDs per toplevel: winfo_id()
-        try:
-            user32 = ctypes.WinDLL("user32", use_last_error=True)
-            hwnd   = self.winfo_id()
-            parent = user32.GetParent(hwnd)
-            return parent if parent else hwnd
-        except Exception:
-            return self.winfo_id()
+        return _win_toplevel_hwnd(self)
 
     def _enable_dark_titlebar(self):
-        # Tell DWM this window uses a dark theme (DWMWA_USE_IMMERSIVE_DARK_MO...
-        try:
-            hwnd = self._toplevel_hwnd()
-            value = ctypes.c_int(1)
-            for attr in (20, 19):  # 20 = current attr id, 19 = older Win10 builds
-                res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, attr, ctypes.byref(value), ctypes.sizeof(value))
-                if res == 0:
-                    break
-            DWMWA_TRANSITIONS_FORCEDISABLED = 3
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_TRANSITIONS_FORCEDISABLED,
-                ctypes.byref(value), ctypes.sizeof(value))
-        except Exception:
-            pass
+        _win_enable_dark_titlebar(self)
 
     def _fix_window_class_background(self):
         # Windows repaints a window in two layers: first it erases the client
@@ -1057,6 +1075,7 @@ class ProcessX(tk.Tk):
 
         self._btn(btn_row, "Rules",          self._open_rules_window).pack(side="left", padx=(0, 3), pady=2)
         self._btn(btn_row, "Add to Startup", self._add_startup).pack(side="left", padx=3, pady=2)
+        self._btn(btn_row, "Refresh", self._auto_refresh).pack(side="left", padx=3, pady=2)
 
         # right-aligned logo + "by jadenpeek", roughly above the CPU Sets
         tk.Label(btn_row, text="by jadenpeek",
@@ -1098,6 +1117,7 @@ class ProcessX(tk.Tk):
         proc_sb.pack(side="right", fill="y")
         self.proc_tree.pack(fill="both", expand=True)
         self.proc_tree.bind("<Double-1>", self._proc_tree_double_click)
+        self.proc_tree.bind("<ButtonPress-1>", self._on_proc_tree_press, add="+")
         self.proc_tree.bind("<ButtonRelease-1>", self._on_proc_tree_release, add="+")
         self.proc_tree.bind("<Button-1>", self._clear_proc_selection, add="+")
         self.proc_tree.bind("<Escape>", self._clear_proc_selection_key)
@@ -1109,6 +1129,8 @@ class ProcessX(tk.Tk):
 
         self._open_groups: set = set()
         self._icon_cache: dict = {}   # exe_name_lower -> PhotoImage | None
+        self._io_pri_cache: dict = {}  # pid -> (timestamp, io_priority_str)
+        self._aff_cache: dict = {}     # pid -> (timestamp, live_affinity_list)
 
         # hidden rules treeview (kept alive for _refresh_rules_list compat)
         self.tree = ttk.Treeview(self, columns=("exe","priority","io","affinity","status"),
@@ -1124,11 +1146,31 @@ class ProcessX(tk.Tk):
         self._style_tree()
         self.after(300, self._sync_window_to_columns)
 
-    def _on_proc_tree_release(self, event):
-        # After the user finishes dragging a column border (esp. Name wider),
+    def _snapshot_col_widths(self):
+        widths = {"#0": self.proc_tree.column("#0", "width")}
+        for c in self.proc_tree["columns"]:
+            widths[c] = self.proc_tree.column(c, "width")
+        return widths
+
+    def _on_proc_tree_press(self, event):
+        # Snapshot widths BEFORE any possible drag, so we can tell on release
+        # whether a real resize happened or the user just clicked/sorted.
         try:
-            region = self.proc_tree.identify_region(event.x, event.y)
-            if region in ("separator", "heading"):
+            self._pre_drag_widths = self._snapshot_col_widths()
+        except Exception:
+            self._pre_drag_widths = None
+
+    def _on_proc_tree_release(self, event):
+        # Only grow the window if a column's width actually changed between
+        # press and release. A plain click on the separator hotzone (no
+        # drag) or a heading click (sorting) will have identical before/after
+        # widths, so this correctly ignores both.
+        try:
+            before = getattr(self, "_pre_drag_widths", None)
+            if before is None:
+                return
+            after = self._snapshot_col_widths()
+            if after != before:
                 self.after(10, self._sync_window_to_columns)
         except Exception:
             pass
@@ -1256,15 +1298,47 @@ class ProcessX(tk.Tk):
             self.tree.selection_set(restore_id)
 
     def _auto_refresh(self):
+        # Runs once at startup, and again whenever "Refresh" is clicked -
+        # no longer reschedules itself, so there's no periodic background
+        # cost. The actual process/priority/affinity data collection (the
+        # syscall-heavy part) happens on a worker thread via
+        # _auto_refresh_worker; only the fast Treeview render happens here
+        # on the UI thread once that data comes back.
         self._refresh_rules_list()
-        # Skip rebuilding the process tree while any group's dropdown
         has_open_dropdown = any(
             self.proc_tree.item(iid, "open")
             for iid in self.proc_tree.get_children()
         )
         if not has_open_dropdown:
-            self._refresh_proc_list()
-        self.after(2000, self._auto_refresh)
+            threading.Thread(target=self._auto_refresh_worker, daemon=True).start()
+
+    def _auto_refresh_worker(self):
+        # Background thread: collect the snapshot (no Tkinter calls allowed
+        # here), then hand it to the UI thread via self.after(0, ...) - the
+        # only thread-safe way to touch widgets from outside the main loop.
+        try:
+            snapshot = self._collect_proc_snapshot()
+        except Exception:
+            return
+        self.after(0, self._refresh_proc_list, snapshot)
+
+    def _on_watcher_rule_applied(self):
+        # Called directly from the rule-watcher thread the moment it
+        # auto-applies a saved rule to a newly launched process (e.g.
+        # cs2.exe starting). We're already off the main thread here, so
+        # it's safe to collect the snapshot right away - only the final
+        # render gets handed to the UI thread via self.after. This means
+        # the list catches up immediately on real events, without any
+        # periodic polling in between.
+        try:
+            snapshot = self._collect_proc_snapshot()
+        except Exception:
+            return
+        self.after(0, self._apply_watcher_refresh, snapshot)
+
+    def _apply_watcher_refresh(self, snapshot):
+        self._refresh_rules_list()
+        self._refresh_proc_list(snapshot)
 
     def _clear_proc_selection(self, event):
         # Clicking empty space below/between rows clears the selection,
@@ -1277,61 +1351,105 @@ class ProcessX(tk.Tk):
         self.proc_tree.selection_remove(*self.proc_tree.selection())
         self.proc_tree.focus("")
 
-    def _refresh_proc_list(self):
-        # Rebuild the live process tree: grouped by exe, sorted by total RAM...
-        from collections import defaultdict
+    # Per-pid cache for the two expensive WinAPI/ctypes lookups below.
+    # Both require an OpenProcess/query/CloseHandle round trip (or a full
+    # CPU-set syscall), so re-running them for every process on every 2s
+    # refresh is the single biggest source of CPU spikes. A short TTL means
+    # they're recomputed every ~6s instead of every ~2s (3x fewer calls)
+    # while still staying reasonably fresh for display purposes.
+    _IO_PRI_TTL  = 6.0
+    _AFF_TTL     = 6.0
 
-        def _priority_name(nice):
-            _map = {
-                psutil.IDLE_PRIORITY_CLASS:         "Idle",
-                psutil.BELOW_NORMAL_PRIORITY_CLASS: "Below Normal",
-                psutil.NORMAL_PRIORITY_CLASS:       "Normal",
-                psutil.ABOVE_NORMAL_PRIORITY_CLASS: "Above Normal",
-                psutil.HIGH_PRIORITY_CLASS:         "High",
-                psutil.REALTIME_PRIORITY_CLASS:     "Realtime",
-            }
-            return _map.get(nice, "Normal")
+    def _priority_name(self, nice):
+        _map = {
+            psutil.IDLE_PRIORITY_CLASS:         "Idle",
+            psutil.BELOW_NORMAL_PRIORITY_CLASS: "Below Normal",
+            psutil.NORMAL_PRIORITY_CLASS:       "Normal",
+            psutil.ABOVE_NORMAL_PRIORITY_CLASS: "Above Normal",
+            psutil.HIGH_PRIORITY_CLASS:         "High",
+            psutil.REALTIME_PRIORITY_CLASS:     "Realtime",
+        }
+        return _map.get(nice, "Normal")
 
-        def _io_priority_name(pid):
-            try:
-                from ctypes import windll, byref, c_ulong
-                hProc = windll.kernel32.OpenProcess(0x1000, False, pid)
-                if not hProc:
-                    return "Not Specified"
+    def _io_priority_name_cached(self, pid):
+        import time
+        now = time.monotonic()
+        cached = self._io_pri_cache.get(pid)
+        if cached and (now - cached[0]) < self._IO_PRI_TTL:
+            return cached[1]
+        try:
+            from ctypes import windll, byref, c_ulong
+            hProc = windll.kernel32.OpenProcess(0x1000, False, pid)
+            if not hProc:
+                val_str = "Not Specified"
+            else:
                 val = c_ulong(0)
                 _NtQIP = windll.ntdll.NtQueryInformationProcess
                 status = _NtQIP(hProc, 33, byref(val), 4, None)
                 windll.kernel32.CloseHandle(hProc)
-                if status == 0:
-                    return {0: "Very Low", 1: "Low", 2: "Normal", 3: "High"}.get(val.value, "Normal")
-            except Exception:
-                pass
-            return "Not Specified"
+                val_str = {0: "Very Low", 1: "Low", 2: "Normal", 3: "High"}.get(val.value, "Normal") if status == 0 else "Not Specified"
+        except Exception:
+            val_str = "Not Specified"
+        self._io_pri_cache[pid] = (now, val_str)
+        return val_str
 
-        # snapshot (background-friendly: collect all data first)
+    def _effective_cpu_sets_cached(self, pid):
+        import time
+        now = time.monotonic()
+        cached = self._aff_cache.get(pid)
+        if cached and (now - cached[0]) < self._AFF_TTL:
+            return cached[1]
+        live = get_effective_cpu_sets(pid)
+        self._aff_cache[pid] = (now, live)
+        return live
+
+    @staticmethod
+    def _fmt_ram(b):
+        if b >= 1 << 30: return f"{b/(1<<30):.1f} GB"
+        if b >= 1 << 20: return f"{b/(1<<20):.0f} MB"
+        if b >= 1 << 10: return f"{b/(1<<10):.0f} KB"
+        return f"{b} B"
+
+    @staticmethod
+    def _fmt_cpu(pct):
+        return f"{pct:.1f}%"
+
+    def _collect_proc_snapshot(self):
+        # Gathers every process/priority/I-O/affinity value needed to render
+        # the tree. Deliberately contains ZERO Tkinter calls, so it's safe to
+        # run on a background thread (see _auto_refresh) - this is where all
+        # the syscall/ctypes-heavy work lives, kept off the UI thread so it
+        # can't block mouse/window responsiveness while it runs.
+        from collections import defaultdict, Counter
+
+        _priority_name    = self._priority_name
+        _io_priority_name = self._io_priority_name_cached
+        _fmt_ram          = self._fmt_ram
+        _fmt_cpu          = self._fmt_cpu
+
         procs = []
         for p in psutil.process_iter(["name", "pid", "memory_info", "nice", "cpu_percent"]):
             try:
-                info = p.info
-                name = (info["name"] or "").strip()
-                if not name:
-                    continue
-                try:
-                    # Task Manager's "Memory" column is the process's private
-                    ram = p.memory_full_info().uss
-                except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
+                with p.oneshot():
+                    info = p.info
+                    name = (info["name"] or "").strip()
+                    if not name:
+                        continue
+                    # Working-set RSS instead of USS: USS requires an extra
+                    # per-process page-walk query and is the single most
+                    # expensive call in this loop for negligible display
+                    # benefit over plain RSS at a 2s refresh cadence.
                     ram = info["memory_info"].rss if info["memory_info"] else 0
-                nice = info["nice"]
-                # "System Idle Process" is a bookkeeping placeholder, not a real
-                if name.lower() == "system idle process":
-                    cpu = 0.0
-                else:
-                    cpu  = (info["cpu_percent"] or 0.0) / CPU_COUNT
-                procs.append((name, info["pid"], ram, nice, cpu))
+                    nice = info["nice"]
+                    # "System Idle Process" is a bookkeeping placeholder, not a real
+                    if name.lower() == "system idle process":
+                        cpu = 0.0
+                    else:
+                        cpu  = (info["cpu_percent"] or 0.0) / CPU_COUNT
+                    procs.append((name, info["pid"], ram, nice, cpu))
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
 
-        # ── group and sort by total RAM desc
         groups: dict = defaultdict(list)
         for name, pid, ram, nice, cpu in procs:
             groups[name].append((pid, ram, nice, cpu))
@@ -1341,6 +1459,73 @@ class ProcessX(tk.Tk):
             key=lambda kv: sum(r for _, r, _, _ in kv[1]),
             reverse=True
         )
+
+        rules_lower = {k.lower() for k in self.rules}
+        snapshot = []
+
+        for name, instances in group_order:
+            instances = sorted(instances, key=lambda x: x[1], reverse=True)
+            has_children = len(instances) > 1
+
+            if has_children:
+                dominant_nice = Counter(n for _, _, n, _ in instances).most_common(1)[0][0]
+                rep_pid   = instances[0][0]
+                pri_str   = _priority_name(dominant_nice)
+                total_ram = sum(r for _, r, _, _ in instances)
+                total_cpu = sum(c for _, _, _, c in instances)
+            else:
+                rep_pid, total_ram, nice, total_cpu = instances[0]
+                pri_str = _priority_name(nice)
+
+            name_lower = name.lower()
+            if name_lower in rules_lower and "priority" in self.rules[name_lower]:
+                pri_str = self.rules[name_lower]["priority"]
+
+            io_str  = _io_priority_name(rep_pid)
+            ram_str = _fmt_ram(total_ram)
+            cpu_str = _fmt_cpu(total_cpu)
+
+            if name_lower in rules_lower and self.rules[name_lower].get("affinity"):
+                aff_str = self._aff_str(self.rules[name_lower]["affinity"])
+            else:
+                live = self._effective_cpu_sets_cached(rep_pid)
+                aff_str = self._aff_str(live) if live else "all"
+
+            children = []
+            if has_children:
+                rule_priority = self.rules[name_lower].get("priority") if name_lower in rules_lower else None
+                rule_affinity = self.rules[name_lower].get("affinity") if name_lower in rules_lower else None
+
+                for pid, ram, nice, cpu in instances:
+                    child_pri = rule_priority or _priority_name(nice)
+                    child_io  = _io_priority_name(pid)
+                    if rule_affinity:
+                        child_aff = self._aff_str(rule_affinity)
+                    else:
+                        child_live = self._effective_cpu_sets_cached(pid)
+                        child_aff = self._aff_str(child_live) if child_live else "all"
+
+                    children.append({
+                        "pid": pid, "cpu_str": _fmt_cpu(cpu), "ram_str": _fmt_ram(ram),
+                        "pri_str": child_pri, "io_str": child_io, "aff_str": child_aff,
+                    })
+
+            snapshot.append({
+                "name": name, "has_children": has_children,
+                "cpu_str": cpu_str, "ram_str": ram_str, "pri_str": pri_str,
+                "io_str": io_str, "aff_str": aff_str, "children": children,
+            })
+
+        return snapshot
+
+    def _refresh_proc_list(self, snapshot=None):
+        # Main-thread-only: renders a pre-collected snapshot into the
+        # Treeview. Fast - no syscalls, just widget updates - so even though
+        # it still does a full delete+rebuild, it no longer blocks the UI
+        # for long enough to cause mouse stutter. If called with no snapshot
+        # (rare direct calls), it collects synchronously as a fallback.
+        if snapshot is None:
+            snapshot = self._collect_proc_snapshot()
 
         # ── preserve open groups and selection
         currently_open = set()
@@ -1359,88 +1544,33 @@ class ProcessX(tk.Tk):
 
         # ── rebuild
         self.proc_tree.delete(*self.proc_tree.get_children())
-        rules_lower = {k.lower() for k in self.rules}
         restore_iid = None
 
-        def _fmt_ram(b):
-            if b >= 1 << 30: return f"{b/(1<<30):.1f} GB"
-            if b >= 1 << 20: return f"{b/(1<<20):.0f} MB"
-            if b >= 1 << 10: return f"{b/(1<<10):.0f} KB"
-            return f"{b} B"
-
-        def _fmt_cpu(pct):
-            return f"{pct:.1f}%"
-
-        for name, instances in group_order:
-            tag = "group"  # no green in main list
-
-            # Sort individual instances by RAM usage, heaviest first. The
-            instances = sorted(instances, key=lambda x: x[1], reverse=True)
-            has_children = len(instances) > 1
-
-            if has_children:
-                from collections import Counter
-                dominant_nice = Counter(n for _, _, n, _ in instances).most_common(1)[0][0]
-                rep_pid   = instances[0][0]
-                pri_str   = _priority_name(dominant_nice)
-                total_ram = sum(r for _, r, _, _ in instances)
-                total_cpu = sum(c for _, _, _, c in instances)
-            else:
-                rep_pid, total_ram, nice, total_cpu = instances[0]
-                pri_str = _priority_name(nice)
-
-            # If a rule exists for this EXE, it's the source of truth for the
-            name_lower = name.lower()
-            if name_lower in rules_lower and "priority" in self.rules[name_lower]:
-                pri_str = self.rules[name_lower]["priority"]
-
-            io_str  = _io_priority_name(rep_pid)
-            ram_str = _fmt_ram(total_ram)
-            cpu_str = _fmt_cpu(total_cpu)
-
-            if name_lower in rules_lower and self.rules[name_lower].get("affinity"):
-                aff_str = self._aff_str(self.rules[name_lower]["affinity"])
-            else:
-                live = get_effective_cpu_sets(rep_pid)
-                aff_str = self._aff_str(live) if live else "all"
-
+        for grp in snapshot:
+            name = grp["name"]
             icon = self._get_exe_icon(name)
 
             iid = self.proc_tree.insert(
                 "", "end",
                 image=icon if icon else "",
-                values=(" " + name, cpu_str, ram_str, pri_str, io_str, aff_str),
-                tags=(tag,)
+                values=(" " + name, grp["cpu_str"], grp["ram_str"], grp["pri_str"], grp["io_str"], grp["aff_str"]),
+                tags=("group",)
             )
             if sel_val and sel_val[0] == " " + name:
                 restore_iid = iid
 
-            # child rows: one per running instance, RAM-sorted desc
-            if has_children:
-                rule_priority = self.rules[name_lower].get("priority") if name_lower in rules_lower else None
-                rule_affinity = self.rules[name_lower].get("affinity") if name_lower in rules_lower else None
+            for child in grp["children"]:
+                child_iid = self.proc_tree.insert(
+                    iid, "end",
+                    values=("   " + name, child["cpu_str"], child["ram_str"],
+                            child["pri_str"], child["io_str"], child["aff_str"]),
+                    tags=("child",)
+                )
+                if sel_val and sel_val[0] == "   " + name and sel_val[2] == child["ram_str"]:
+                    restore_iid = child_iid
 
-                for pid, ram, nice, cpu in instances:
-                    child_pri = rule_priority or _priority_name(nice)
-                    child_io  = _io_priority_name(pid)
-                    if rule_affinity:
-                        child_aff = self._aff_str(rule_affinity)
-                    else:
-                        child_live = get_effective_cpu_sets(pid)
-                        child_aff = self._aff_str(child_live) if child_live else "all"
-
-                    child_iid = self.proc_tree.insert(
-                        iid, "end",
-                        values=("   " + name, _fmt_cpu(cpu), _fmt_ram(ram),
-                                child_pri, child_io, child_aff),
-                        tags=("child",)
-                    )
-                    if sel_val and sel_val[0] == "   " + name and sel_val[2] == _fmt_ram(ram):
-                        restore_iid = child_iid
-
-                # keep the group expanded/collapsed as it was before refresh
-                if name in currently_open:
-                    self.proc_tree.item(iid, open=True)
+            if grp["has_children"] and name in currently_open:
+                self.proc_tree.item(iid, open=True)
 
         if restore_iid:
             self.proc_tree.focus(restore_iid)
@@ -1661,17 +1791,6 @@ class ProcessX(tk.Tk):
         self._refresh_rules_list()
 
 
-    def _open_add_rule(self):
-        # Prompt for an EXE name, then open the editor for it.
-        dlg = _ExeNameDialog(self)
-        self.wait_window(dlg)
-        exe_name = dlg.result
-        if not exe_name:
-            return
-
-        EditorDialog(self, proc=None, proc_name=exe_name, rules=self.rules)
-
-
     def _open_editor_for_exe(self, exe_name: str):
         # Open the rule editor for the given EXE name (used from proc list do...
         proc = None
@@ -1698,6 +1817,8 @@ class ProcessX(tk.Tk):
         win.geometry("800x420")
         win.resizable(True, True)
         win.grab_set()
+        win.update_idletasks()   # forces the real HWND to exist
+        _win_enable_dark_titlebar(win)
 
         cols = ("exe", "priority", "io", "affinity", "status")
         tree = ttk.Treeview(win, columns=cols, show="tree headings",
@@ -1928,53 +2049,6 @@ class ProcessX(tk.Tk):
             self.destroy()
 
 
-class _ExeNameDialog(tk.Toplevel):
-    # Simple prompt: type an EXE name (e.g. game.exe) to create a new rule.
-    def __init__(self, parent):
-        super().__init__(parent)
-        self.result = None
-        self.title("Add Rule")
-        self.resizable(False, False)
-        self.configure(bg=BG)
-        self.grab_set()
-        w, h = 360, 150
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
-        self._build()
-
-    def _build(self):
-        tk.Label(self, text="EXE name (e.g. game.exe)",
-                 font=(FONT, 10, "bold"), fg=TEXT, bg=BG).pack(anchor="w", padx=16, pady=(14, 4))
-        self._var = tk.StringVar()
-        entry = tk.Entry(self, textvariable=self._var,
-                         font=(FONT, 11, "bold"), bg="#2a2a2a", fg=TEXT,
-                         insertbackground=TEXT, relief="flat",
-                         highlightthickness=1, highlightbackground=BORDER,
-                         highlightcolor=SEL_BG)
-        entry.pack(fill="x", padx=16, pady=4)
-        entry.focus_set()
-        entry.bind("<Return>", lambda e: self._ok())
-
-        btn_row = tk.Frame(self, bg=BG)
-        btn_row.pack(pady=10)
-        for label, cmd in [("OK", self._ok), ("Cancel", self.destroy)]:
-            tk.Button(btn_row, text=label, command=cmd,
-                      font=(FONT, 9, "bold"), bg=BTN_BG, fg=BTN_FG,
-                      relief="flat", padx=10, pady=3,
-                      activebackground="#4a4a4a").pack(side="left", padx=5)
-
-    def _ok(self):
-        val = self._var.get().strip()
-        if not val:
-            messagebox.showwarning("EXE name", "Enter an EXE name.", parent=self)
-            return
-
-        if not val.lower().endswith(".exe"):
-            val += ".exe"
-        self.result = val.lower()
-        self.destroy()
-
-
 class EditorDialog(tk.Toplevel):
     def __init__(self, parent, proc: psutil.Process,
                  proc_name: str, rules: dict):
@@ -1995,6 +2069,8 @@ class EditorDialog(tk.Toplevel):
         y  = (sh - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(820, 560)
+        self.update_idletasks()   # forces the real HWND to exist
+        _win_enable_dark_titlebar(self)
         existing = rules.get(proc_name.lower(), {})
         self._build(existing)
 
