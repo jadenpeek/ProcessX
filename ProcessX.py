@@ -172,6 +172,7 @@ def _detect_cpu_topology() -> dict:
         "has_ccd1": False, "ccd1_start": 16,
         "ht_enabled": True,           # False when HT is off in BIOS (Intel)
         "e_cores_disabled_in_bios": False,  # True when BIOS has E-cores turned off
+        "core_map": None,
     }
     def _parse_vendor_brand(name: str, mfr: str, res: dict):
         res["brand"] = name
@@ -321,6 +322,7 @@ def _detect_cpu_topology() -> dict:
                         result["p_core_count"]   = p_threads
                         result["e_core_count"]   = e_threads
                         result["e_thread_start"] = e_start
+                        result["core_map"] = [e == 0 for e in best]
         except Exception:
             pass
 
@@ -332,19 +334,18 @@ def _detect_cpu_topology() -> dict:
             "250k plus": (6, 12), "250kf plus": (6, 12), "250 plus": (6, 12),
             # Arrow Lake S / Core Ultra 200S
             "285k":  (8, 16), "285kf": (8, 16), "285":   (8, 16),
-            "275k":  (8, 12), "275kf": (8, 12), "275":   (8, 12),
-            "270k":  (8, 12), "270kf": (8, 12), "270":   (8, 12),
-            "265k":  (8, 8),  "265kf": (8, 8),  "265":   (8, 8),
+            "265k":  (8, 12), "265kf": (8, 12), "265":   (8, 12),
             "255k":  (6, 8),  "255kf": (6, 8),  "255":   (6, 8),
-            "245k":  (6, 6),  "245kf": (6, 6),  "245":   (6, 6),
-            "235k":  (6, 8),  "235":   (6, 8),
-            "225k":  (4, 8),  "225":   (4, 8),
-            "215k":  (4, 4),  "215":   (4, 4),
+            "245k":  (6, 8),  "245kf": (6, 8),  "245":   (6, 8),
         }
 
         # Strip trademark suffixes once for all checks below
         _brand_raw   = result["brand"].lower()
         _brand_clean = _brand_raw.replace("(tm)", "").replace("(r)", "").replace("  ", " ")
+
+        # Intel dropped Hyper-Threading across the entire Core Ultra client
+        if "ultra" in _brand_clean or "ultra" in _brand_raw:
+            result["ht_enabled"] = False
 
         def _sku_match(brand_raw, brand_clean, sku_table):
             for key, counts in sku_table.items():
@@ -359,6 +360,20 @@ def _detect_cpu_topology() -> dict:
             result["p_core_count"]   = _p
             result["e_core_count"]   = _e
             result["e_thread_start"] = _p   # E-cores always follow P-cores
+
+        # Arrow Lake / Core Ultra desktop clusters P/E cores in physical
+        def _build_8p_zone_map(e_total):
+            if e_total < 2 or e_total % 2 != 0:
+                return None
+            e1 = e2 = e_total // 2
+            return ([False] * 2 + [True] * e1 + [False] * 4
+                     + [True] * e2 + [False] * 2)
+
+        if result["core_map"] is None and "ultra" in (_brand_clean + _brand_raw):
+            if result["p_core_count"] == 8 and result["e_core_count"] > 0:
+                _zone_map = _build_8p_zone_map(result["e_core_count"])
+                if _zone_map and len(_zone_map) == CPU_COUNT:
+                    result["core_map"] = _zone_map
 
         # E-core BIOS check
         if result["p_core_count"] > 0:
@@ -447,8 +462,14 @@ def _rule_watcher_loop(get_rules_fn):
                         except Exception:
                             pass
 
+                # Any tracked exe that had running instances last cycle but
+                # has none now has fully exited (running -> closed). Worth
+                # the same status + refresh treatment as a launch, so the
+                # list doesn't sit stale showing a game that's no longer open.
+                exited = []
                 for exe in list(last_pids):
                     if exe not in found:
+                        exited.append(exe)
                         del last_pids[exe]
 
                 if paths_updated:
@@ -457,14 +478,19 @@ def _rule_watcher_loop(get_rules_fn):
                     except Exception:
                         pass
 
-                if newly_applied and _watcher_status_cb:
-                    msg = "Auto-applied: " + ", ".join(sorted(set(newly_applied)))
+                status_parts = []
+                if newly_applied:
+                    status_parts.append("Auto-applied: " + ", ".join(sorted(set(newly_applied))))
+                if exited:
+                    status_parts.append("Closed: " + ", ".join(sorted(set(exited))))
+
+                if status_parts and _watcher_status_cb:
                     try:
-                        _watcher_status_cb(msg)
+                        _watcher_status_cb(" | ".join(status_parts))
                     except Exception:
                         pass
 
-                if newly_applied and _watcher_refresh_cb:
+                if (newly_applied or exited) and _watcher_refresh_cb:
                     try:
                         _watcher_refresh_cb()
                     except Exception:
@@ -1074,8 +1100,9 @@ class ProcessX(tk.Tk):
         btn_row.pack(fill="x", padx=12, pady=(2, 3))
 
         self._btn(btn_row, "Rules",          self._open_rules_window).pack(side="left", padx=(0, 3), pady=2)
+        self._btn(btn_row, "Add Rule",       self._open_add_rule).pack(side="left", padx=3, pady=2)
+        self._btn(btn_row, "Refresh",        self._auto_refresh).pack(side="left", padx=3, pady=2)
         self._btn(btn_row, "Add to Startup", self._add_startup).pack(side="left", padx=3, pady=2)
-        self._btn(btn_row, "Refresh", self._auto_refresh).pack(side="left", padx=3, pady=2)
 
         # right-aligned logo + "by jadenpeek", roughly above the CPU Sets
         tk.Label(btn_row, text="by jadenpeek",
@@ -1794,6 +1821,20 @@ class ProcessX(tk.Tk):
         self._refresh_rules_list()
 
 
+    def _open_add_rule(self):
+        # Prompt for an EXE name, then open the editor for it. Lets people
+        # prepare a rule for a game/app they haven't installed yet - it'll
+        # sit ready in Rules and the watcher will apply it the moment that
+        # exe actually launches for the first time.
+        dlg = _ExeNameDialog(self)
+        self.wait_window(dlg)
+        exe_name = dlg.result
+        if not exe_name:
+            return
+
+        EditorDialog(self, proc=None, proc_name=exe_name, rules=self.rules)
+
+
     def _open_editor_for_exe(self, exe_name: str):
         # Open the rule editor for the given EXE name (used from proc list do...
         proc = None
@@ -2052,6 +2093,57 @@ class ProcessX(tk.Tk):
             self.destroy()
 
 
+class _ExeNameDialog(tk.Toplevel):
+    # Simple prompt: type an EXE name (e.g. game.exe) to create a new rule
+    # for something that isn't running yet - or may not even be installed
+    # yet - so the rule is ready and waiting the first time it launches.
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.result = None
+        self.title("Add Rule")
+        self.resizable(False, False)
+        self.configure(bg=BG)
+        self.grab_set()
+        w, h = 360, 150
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
+        self.update_idletasks()   # forces the real HWND to exist
+        _win_enable_dark_titlebar(self)
+        self._build()
+
+    def _build(self):
+        tk.Label(self, text="EXE name (e.g. game.exe)",
+                 font=(FONT, 10, "bold"), fg=TEXT, bg=BG).pack(anchor="w", padx=16, pady=(14, 4))
+        self._var = tk.StringVar()
+        entry = tk.Entry(self, textvariable=self._var,
+                         font=(FONT, 11, "bold"), bg="#2a2a2a", fg=TEXT,
+                         insertbackground=TEXT, relief="flat",
+                         highlightthickness=1, highlightbackground=BORDER,
+                         highlightcolor=SEL_BG)
+        entry.pack(fill="x", padx=16, pady=4)
+        entry.focus_set()
+        entry.bind("<Return>", lambda e: self._ok())
+
+        btn_row = tk.Frame(self, bg=BG)
+        btn_row.pack(pady=10)
+        for label, cmd in [("OK", self._ok), ("Cancel", self.destroy)]:
+            tk.Button(btn_row, text=label, command=cmd,
+                      font=(FONT, 9, "bold"), bg=BTN_BG, fg=BTN_FG,
+                      relief="flat", padx=10, pady=3,
+                      activebackground="#4a4a4a").pack(side="left", padx=5)
+
+    def _ok(self):
+        val = self._var.get().strip()
+        if not val:
+            messagebox.showwarning("EXE name", "Enter an EXE name.", parent=self)
+            return
+
+        if not val.lower().endswith(".exe"):
+            val += ".exe"
+        self.result = val.lower()
+        self.destroy()
+
+
 class EditorDialog(tk.Toplevel):
     def __init__(self, parent, proc: psutil.Process,
                  proc_name: str, rules: dict):
@@ -2168,15 +2260,28 @@ class EditorDialog(tk.Toplevel):
                 v.set(True)
 
         def _ht_off():
-            # P-core threads come in pairs (even index = thread 0, odd = thread 1
-            # of the same physical core); E-cores have no second thread, so they
-            # stay fully enabled regardless of HT state.
-            e_start = CPU_TOPOLOGY["e_thread_start"]
-            for i, v in enumerate(self.aff_vars):
-                if e_start > 0 and i >= e_start:
-                    v.set(True)
-                else:
-                    v.set(i % 2 == 0)
+            # P-core threads come in pairs (thread 0, thread 1 of the same
+            # physical core); E-cores have no second thread, so they stay
+            # fully enabled regardless of HT state.
+            core_map = CPU_TOPOLOGY.get("core_map")
+            if core_map:
+                # Clustered-layout-aware: pair up P-core indices in the
+                # order they appear (not assuming they're contiguous), then
+                # disable the second half of each pair. For a contiguous
+                # layout this reduces to the exact same even/odd split as
+                # the boundary-based branch below - so 12th/13th/14th gen
+                # behave identically either way.
+                p_indices = [i for i, is_e in enumerate(core_map) if not is_e]
+                disable = set(p_indices[j] for j in range(1, len(p_indices), 2))
+                for i, v in enumerate(self.aff_vars):
+                    v.set(i not in disable)
+            else:
+                e_start = CPU_TOPOLOGY["e_thread_start"]
+                for i, v in enumerate(self.aff_vars):
+                    if e_start > 0 and i >= e_start:
+                        v.set(True)
+                    else:
+                        v.set(i % 2 == 0)
 
         def _disable_ccd1():
 
@@ -2194,6 +2299,11 @@ class EditorDialog(tk.Toplevel):
 
         def _disable_ecores():
 
+            core_map = CPU_TOPOLOGY.get("core_map")
+            if core_map:
+                for i, v in enumerate(self.aff_vars):
+                    v.set(not core_map[i])   # keep P-cores on, turn E-cores off
+                return
 
             e_start = CPU_TOPOLOGY["e_thread_start"]
             if e_start <= 0:
@@ -2208,6 +2318,11 @@ class EditorDialog(tk.Toplevel):
 
         def _disable_pcores():
 
+            core_map = CPU_TOPOLOGY.get("core_map")
+            if core_map:
+                for i, v in enumerate(self.aff_vars):
+                    v.set(core_map[i])   # keep E-cores on, turn P-cores off
+                return
 
             e_start = CPU_TOPOLOGY["e_thread_start"]
             if e_start <= 0:
