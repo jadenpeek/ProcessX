@@ -1,4 +1,3 @@
-# ProcessX - CPU Affinity, Priority & I/O Manager
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -31,7 +30,6 @@ _ICON_BYTES_CACHE = None
 _ICON_CACHE_FILE  = CONFIG_FILE.parent / "icon_cache.png"
 
 def _icon_bytes() -> bytes:
-    # Procedurally render the ProcessX logo as a PNG. Rendered at a higher
     global _ICON_BYTES_CACHE
     if _ICON_BYTES_CACHE is not None:
         return _ICON_BYTES_CACHE
@@ -48,12 +46,11 @@ def _icon_bytes() -> bytes:
     import struct, zlib, math
 
     W = H = 256
-    SS = 3                      # samples per axis per pixel (3x3 = 9 samples)
+    SS = 3
     S = W / 680.0
     pixels = bytearray(W * H * 4)
 
     def rect_corners(rx, ry, rw, rh, cx_r, cy_r, angle_deg):
-        # Corners (in output pixel space) of a rotated rect given in SVG coords.
         a = math.radians(angle_deg)
         ca, sa = math.cos(a), math.sin(a)
         local = [(rx, ry), (rx+rw, ry), (rx+rw, ry+rh), (rx, ry+rh)]
@@ -88,7 +85,6 @@ def _icon_bytes() -> bytes:
     bar2 = rect_corners(112.3, 341.2, 455.4, 94.3, 340, 388.3, -39.5)
     sq   = rect_corners(312.4, 312.4,  55.2,  55.2, 340, 340,   45.0)
 
-    # bounding box of the octagon in output pixels — no point rendering the
     xs = [p[0] for p in oct_px]; ys = [p[1] for p in oct_px]
     px0, px1 = max(0, int(min(xs))-1), min(W, int(max(xs))+2)
     py0, py1 = max(0, int(min(ys))-1), min(H, int(max(ys))+2)
@@ -140,7 +136,6 @@ def _icon_bytes() -> bytes:
     return _ICON_BYTES_CACHE
 
 def _make_tk_icon(root, size=None) -> "tk.PhotoImage | None":
-    # Return a PhotoImage built from the generated PNG via PIL, or None o...
     try:
         from PIL import Image as _PIL, ImageTk
         img = _PIL.open(io.BytesIO(_icon_bytes()))
@@ -152,7 +147,6 @@ def _make_tk_icon(root, size=None) -> "tk.PhotoImage | None":
         return None
 
 def _make_pil_icon() -> "PILImage.Image | None":
-    # Return a PIL RGBA Image from the generated PNG (for pystray tray ic...
     try:
         img = PILImage.open(io.BytesIO(_icon_bytes()))
         img = img.convert("RGBA")
@@ -165,13 +159,12 @@ PHYSICAL_COUNT    = psutil.cpu_count(logical=False) or CPU_COUNT
 
 
 def _detect_cpu_topology() -> dict:
-    # Returns a dict with keys:
     result = {
         "vendor": "unknown", "brand": "",
         "p_core_count": 0, "e_core_count": 0, "e_thread_start": -1,
         "has_ccd1": False, "ccd1_start": 16,
-        "ht_enabled": True,           # False when HT is off in BIOS (Intel)
-        "e_cores_disabled_in_bios": False,  # True when BIOS has E-cores turned off
+        "ht_enabled": True,
+        "e_cores_disabled_in_bios": False,
         "core_map": None,
     }
     def _parse_vendor_brand(name: str, mfr: str, res: dict):
@@ -235,7 +228,6 @@ def _detect_cpu_topology() -> dict:
 
 
     if result["vendor"] == "intel":
-        # GLPIE Hyper-Threading probe
         try:
             _RelationProcessorCore = 0
             kernel32 = ctypes.windll.kernel32
@@ -259,7 +251,6 @@ def _detect_cpu_topology() -> dict:
                         _rec_size = int.from_bytes(_data[_offset+4:_offset+8], "little")
                         if _rec_size < 8 or _offset + _rec_size > _needed.value:
                             break
-                        # Flags is at byte offset 8 within SYSTEM_LOGICAL_PROCESSOR_INFORMATI...
                         _flags = _data[_offset + 8] if _offset + 8 < len(_data) else 0
                         if _flags & 1:
                             _ht_seen_on = True
@@ -267,12 +258,10 @@ def _detect_cpu_topology() -> dict:
                             _ht_seen_off = True
                         _offset += _rec_size
 
-                    # HT is considered OFF if no core reported multiple threads
                     if _ht_seen_off and not _ht_seen_on:
                         result["ht_enabled"] = False
         except Exception:
             pass
-        # ── end GLPIE HT probe
 
         try:
             kernel32 = ctypes.windll.kernel32
@@ -307,7 +296,6 @@ def _detect_cpu_topology() -> dict:
                     p = sum(1 for e in efficiency if e > 0)
                     e = sum(1 for e in efficiency if e == 0)
                     if p > 0 and e > 0:
-                        # Sanity-check: total entries must equal logical CPU count,
                         total = p + e
                         if total == CPU_COUNT and p <= total * 0.75 and e <= total * 0.875:
                             best = efficiency
@@ -317,7 +305,6 @@ def _detect_cpu_topology() -> dict:
                     p_threads = sum(1 for e in best if e > 0)
                     e_threads = sum(1 for e in best if e == 0)
                     e_start   = next((i for i, e in enumerate(best) if e == 0), -1)
-                    # Only commit if e_start is a plausible boundary (not core 0 or last core)
                     if 0 < e_start < CPU_COUNT - 1:
                         result["p_core_count"]   = p_threads
                         result["e_core_count"]   = e_threads
@@ -327,23 +314,18 @@ def _detect_cpu_topology() -> dict:
             pass
 
 
-        # Known hybrid SKU table — checked for ALL Intel hybrid CPUs.
         _known_hybrid_skus = {
-            # Arrow Lake Refresh "Plus" (no HT/SMT — logical == physical)
             "270k plus": (8, 16), "270kf plus": (8, 16), "270 plus": (8, 16),
             "250k plus": (6, 12), "250kf plus": (6, 12), "250 plus": (6, 12),
-            # Arrow Lake S / Core Ultra 200S
             "285k":  (8, 16), "285kf": (8, 16), "285":   (8, 16),
             "265k":  (8, 12), "265kf": (8, 12), "265":   (8, 12),
             "255k":  (6, 8),  "255kf": (6, 8),  "255":   (6, 8),
             "245k":  (6, 8),  "245kf": (6, 8),  "245":   (6, 8),
         }
 
-        # Strip trademark suffixes once for all checks below
         _brand_raw   = result["brand"].lower()
         _brand_clean = _brand_raw.replace("(tm)", "").replace("(r)", "").replace("  ", " ")
 
-        # Intel dropped Hyper-Threading across the entire Core Ultra client
         if "ultra" in _brand_clean or "ultra" in _brand_raw:
             result["ht_enabled"] = False
 
@@ -353,15 +335,13 @@ def _detect_cpu_topology() -> dict:
                     return counts
             return None
 
-        # Pass 1: always try the SKU table first for known hybrid parts.
         _sku_hit = _sku_match(_brand_raw, _brand_clean, _known_hybrid_skus)
         if _sku_hit:
             _p, _e = _sku_hit
             result["p_core_count"]   = _p
             result["e_core_count"]   = _e
-            result["e_thread_start"] = _p   # E-cores always follow P-cores
+            result["e_thread_start"] = _p
 
-        # Arrow Lake / Core Ultra desktop clusters P/E cores in physical
         def _build_8p_zone_map(e_total):
             if e_total < 2 or e_total % 2 != 0:
                 return None
@@ -375,14 +355,11 @@ def _detect_cpu_topology() -> dict:
                 if _zone_map and len(_zone_map) == CPU_COUNT:
                     result["core_map"] = _zone_map
 
-        # E-core BIOS check
         if result["p_core_count"] > 0:
             _expected_p_threads = result["p_core_count"]
             if CPU_COUNT <= _expected_p_threads:
                 result["e_cores_disabled_in_bios"] = True
-        # ── end E-core BIOS check
 
-        # Pass 2: dynamic fallback when e_core_count is still 0
         if result["e_core_count"] == 0 and PHYSICAL_COUNT and CPU_COUNT:
             brand = _brand_raw
             hybrid_keywords = ["12th", "13th", "14th", "core ultra",
@@ -422,8 +399,7 @@ _watcher_refresh_cb = None
 _watcher_lock      = threading.Lock()
 
 def _rule_watcher_loop(get_rules_fn):
-    # Poll every 2 s. For each saved rule EXE:
-    last_pids: dict = {}   # exe -> set of pids we've already applied the rule to
+    last_pids: dict = {}
 
     while True:
         try:
@@ -431,7 +407,7 @@ def _rule_watcher_loop(get_rules_fn):
             if rules:
 
                 want = set(rules.keys())
-                found: dict = {}   # exe -> list of (proc, pid)
+                found: dict = {}
                 for p in psutil.process_iter(["name", "pid"]):
                     try:
                         n = (p.info["name"] or "").lower()
@@ -454,7 +430,6 @@ def _rule_watcher_loop(get_rules_fn):
                                 pass
                     last_pids[exe] = current_pids
 
-                    # Remember where this EXE actually lives on disk the first
                     if procs and not rules[exe].get("exe_path"):
                         try:
                             rules[exe]["exe_path"] = procs[0][0].exe()
@@ -462,10 +437,6 @@ def _rule_watcher_loop(get_rules_fn):
                         except Exception:
                             pass
 
-                # Any tracked exe that had running instances last cycle but
-                # has none now has fully exited (running -> closed). Worth
-                # the same status + refresh treatment as a launch, so the
-                # list doesn't sit stale showing a game that's no longer open.
                 exited = []
                 for exe in list(last_pids):
                     if exe not in found:
@@ -538,7 +509,6 @@ _NtQIP.restype  = ctypes.c_long
 _NtQIP.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p]
 
 def get_io_priority(pid: int) -> int:
-    # Read I/O priority via NtQueryInformationProcess(class=33).
     try:
         kernel32 = ctypes.windll.kernel32
         hProcess = kernel32.OpenProcess(0x1000, False, pid)
@@ -557,7 +527,6 @@ def get_io_priority(pid: int) -> int:
 
 
 def _grant_increase_base_priority_privilege() -> bool:
-    # Grant SeIncreaseBasePriorityPrivilege to the Administrators group v...
     try:
         import tempfile
         cfg = Path(tempfile.gettempdir()) / "processx_secpol.cfg"
@@ -622,7 +591,6 @@ def _grant_increase_base_priority_privilege() -> bool:
 
 
 def _enable_privilege(privilege_name: str) -> bool:
-    # Enable a token privilege using the current-process pseudo-handle (-1).
     try:
         TOKEN_ADJUST_PRIVILEGES = 0x0020
         TOKEN_QUERY             = 0x0008
@@ -672,7 +640,6 @@ _enable_privilege("SeIncreaseBasePriorityPrivilege")
 
 
 def set_io_priority(pid: int, level: int) -> tuple:
-    # Set I/O priority via NtSetInformationProcess(class=33).
     if not 0 <= level <= 3:
         return (False, f"bad level {level}")
     try:
@@ -700,7 +667,6 @@ def set_io_priority(pid: int, level: int) -> tuple:
 _cpu_set_ids: list = []
 
 def _enumerate_cpu_set_ids() -> list:
-    # Return a list of CPU Set IDs in logical-CPU order, or [] on failure.
     try:
         kernel32 = ctypes.windll.kernel32
 
@@ -739,7 +705,6 @@ _id_to_cpu_idx: dict = {v: i for i, v in enumerate(_cpu_set_ids)}
 
 
 def set_cpu_sets(pid: int, cpu_indices: list) -> bool:
-    # Apply CPU Sets to a process via SetProcessDefaultCpuSets.
     if not (_cpu_set_ids and all(i < len(_cpu_set_ids) for i in cpu_indices)):
         return False
     try:
@@ -773,7 +738,6 @@ def set_cpu_sets(pid: int, cpu_indices: list) -> bool:
 
 
 def get_effective_cpu_sets(pid: int) -> list:
-    # Return the logical CPU indices currently assigned to the process vi...
     if not _cpu_set_ids:
         return []
     try:
@@ -814,7 +778,6 @@ def save_rules(rules: dict):
 
 
 def _validate_rules_data(data) -> tuple:
-    # Sanity-check a loaded JSON blob before it's accepted as a rules set.
     if not isinstance(data, dict):
         raise ValueError("File does not contain a rules object (expected a JSON object at the top level).")
 
@@ -859,7 +822,6 @@ def _validate_rules_data(data) -> tuple:
 
 
 def apply_rule(proc: psutil.Process, rule: dict) -> list:
-    # Apply one rule to one running process and report per-property success.
     if proc is None:
         return ["CPU Sets: Saved", "CPU Priority: Saved", "I/O Priority: Saved"]
     pid = proc.pid
@@ -899,16 +861,14 @@ def apply_all_rules(rules: dict):
 
 
 def _windows_default_rule() -> dict:
-    # The 'no rule' state — Windows' own defaults for everything we manage.
     return {
         "priority":    "Normal",
-        "io_priority": 2,  # Normal
+        "io_priority": 2,
         "affinity":    list(range(CPU_COUNT)),
     }
 
 
 def revert_running_instances(exe_name: str):
-    # Reset CPU priority, I/O priority, and CPU sets back to Windows defa...
     default_rule = _windows_default_rule()
     exe_lower = exe_name.lower()
     for p in psutil.process_iter(["name", "pid"]):
@@ -921,7 +881,6 @@ def revert_running_instances(exe_name: str):
 
 
 def _write_ico(png_bytes: bytes, path: Path):
-    # Write a proper multi-resolution ICO (16/20/24/32/40/48/64/256px) built
     try:
         from PIL import Image as _PIL
         img = _PIL.open(io.BytesIO(png_bytes)).convert("RGBA")
@@ -940,8 +899,6 @@ def _write_ico(png_bytes: bytes, path: Path):
 
 
 def _win_toplevel_hwnd(win):
-    # Same HWND-resolution trick as ProcessX._toplevel_hwnd, but usable on
-    # any Tk widget (Toplevel dialogs included), not just the main window.
     try:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         hwnd   = win.winfo_id()
@@ -951,13 +908,10 @@ def _win_toplevel_hwnd(win):
         return win.winfo_id()
 
 def _win_enable_dark_titlebar(win):
-    # Tell DWM this window uses a dark theme. Call after win.update_idletasks()
-    # so the real HWND already exists. Works for the main window and for any
-    # Toplevel dialog (Rules window, rule editor, Add Rule prompt, etc).
     try:
         hwnd = _win_toplevel_hwnd(win)
         value = ctypes.c_int(1)
-        for attr in (20, 19):  # 20 = current attr id, 19 = older Win10 builds
+        for attr in (20, 19):
             res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, attr, ctypes.byref(value), ctypes.sizeof(value))
             if res == 0:
@@ -988,7 +942,7 @@ class ProcessX(tk.Tk):
             y = (sh - h) // 2
             self.geometry(f"{w}x{h}+{x}+{y}")
 
-        self.update_idletasks()   # forces the real HWND to exist
+        self.update_idletasks()
         self._enable_dark_titlebar()
         self._fix_window_class_background()
 
@@ -1017,15 +971,15 @@ class ProcessX(tk.Tk):
         self._build_ui()
         self.bind("<Escape>", self._clear_proc_selection_key)
         self._refresh_rules_list()
-        self._auto_refresh()
-
 
         self._tray_icon = None
+        self._refresh_job = None
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._start_tray()
 
         if not self._boot_launch:
             self.deiconify()
+        self._auto_refresh()
 
     def _toplevel_hwnd(self):
         return _win_toplevel_hwnd(self)
@@ -1034,7 +988,6 @@ class ProcessX(tk.Tk):
         _win_enable_dark_titlebar(self)
 
     def _fix_window_class_background(self):
-        # Windows repaints a window in two layers: first it erases the client
         try:
             gdi32  = ctypes.WinDLL("gdi32",  use_last_error=True)
             user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -1042,7 +995,6 @@ class ProcessX(tk.Tk):
             gdi32.CreateSolidBrush.restype  = ctypes.c_void_p
             gdi32.CreateSolidBrush.argtypes = [ctypes.wintypes.DWORD]
 
-            # COLORREF is 0x00BBGGRR — BG = "#111111" so r=g=b=0x11
             colorref = 0x11 | (0x11 << 8) | (0x11 << 16)
             brush = gdi32.CreateSolidBrush(colorref)
             if not brush:
@@ -1063,7 +1015,6 @@ class ProcessX(tk.Tk):
             pass
 
     def _apply_taskbar_icon(self):
-        # Force the Windows taskbar button to show our icon (deferred until w...
         try:
             WM_SETICON  = 0x0080
             ICON_SMALL  = 0
@@ -1095,16 +1046,13 @@ class ProcessX(tk.Tk):
 
     def _build_ui(self):
 
-        # ── Header buttons
         btn_row = tk.Frame(self, bg=BG, pady=6)
         btn_row.pack(fill="x", padx=12, pady=(2, 3))
 
         self._btn(btn_row, "Rules",          self._open_rules_window).pack(side="left", padx=(0, 3), pady=2)
         self._btn(btn_row, "Add Rule",       self._open_add_rule).pack(side="left", padx=3, pady=2)
-        self._btn(btn_row, "Refresh",        self._auto_refresh).pack(side="left", padx=3, pady=2)
         self._btn(btn_row, "Add to Startup", self._add_startup).pack(side="left", padx=3, pady=2)
 
-        # right-aligned logo + "by jadenpeek", roughly above the CPU Sets
         tk.Label(btn_row, text="by jadenpeek",
                  font=(FONT, 8, "bold"), fg=TEXT, bg=BG).pack(side="right", padx=(0, 6), pady=2)
         if self._header_logo:
@@ -1114,7 +1062,6 @@ class ProcessX(tk.Tk):
                      fg=TEXT, bg=BG).pack(side="right", padx=(6, 0), pady=2)
 
 
-        # ── Live process list
         tf = tk.Frame(self, bg=BG, highlightthickness=0, bd=0)
         tf.pack(fill="both", expand=True, padx=12, pady=(0, 3))
 
@@ -1123,7 +1070,6 @@ class ProcessX(tk.Tk):
                                       show="tree headings",
                                       selectmode="browse", style="AM.Treeview")
         proc_col_cfg = [
-            # col,        label,           width, minwidth, head_anchor, cell_anchor
             ("name",     "Name",           150, 70,  "w", "w"),
             ("cpu",      "CPU",            70,  60,  "center", "center"),
             ("ram",      "Memory",         90,  80,  "center", "center"),
@@ -1155,15 +1101,13 @@ class ProcessX(tk.Tk):
         self.proc_tree.tag_configure("child_rule", foreground="#7ecf7e")
 
         self._open_groups: set = set()
-        self._icon_cache: dict = {}   # exe_name_lower -> PhotoImage | None
-        self._io_pri_cache: dict = {}  # pid -> (timestamp, io_priority_str)
-        self._aff_cache: dict = {}     # pid -> (timestamp, live_affinity_list)
+        self._icon_cache: dict = {}
+        self._io_pri_cache: dict = {}
+        self._aff_cache: dict = {}
 
-        # hidden rules treeview (kept alive for _refresh_rules_list compat)
         self.tree = ttk.Treeview(self, columns=("exe","priority","io","affinity","status"),
                                  show="headings", style="AM.Treeview")
 
-        # ── Status bar
         tk.Frame(self, bg=BG, height=4).pack(fill="x")
         self.status_var = tk.StringVar(value="Watcher running — rules auto-applied when EXE starts.")
         tk.Label(self, textvariable=self.status_var,
@@ -1180,18 +1124,12 @@ class ProcessX(tk.Tk):
         return widths
 
     def _on_proc_tree_press(self, event):
-        # Snapshot widths BEFORE any possible drag, so we can tell on release
-        # whether a real resize happened or the user just clicked/sorted.
         try:
             self._pre_drag_widths = self._snapshot_col_widths()
         except Exception:
             self._pre_drag_widths = None
 
     def _on_proc_tree_release(self, event):
-        # Only grow the window if a column's width actually changed between
-        # press and release. A plain click on the separator hotzone (no
-        # drag) or a heading click (sorting) will have identical before/after
-        # widths, so this correctly ignores both.
         try:
             before = getattr(self, "_pre_drag_widths", None)
             if before is None:
@@ -1203,12 +1141,11 @@ class ProcessX(tk.Tk):
             pass
 
     def _sync_window_to_columns(self):
-        # Grow (never shrink) the window so every column — Name included —
         try:
             total = self.proc_tree.column("#0", "width")
             for c in self.proc_tree["columns"]:
                 total += self.proc_tree.column(c, "width")
-            total += 24 + 28   # scrollbar + outer padding fudge
+            total += 24 + 28
             cur_w = self.winfo_width()
             if total > cur_w:
                 h = self.winfo_height()
@@ -1252,7 +1189,6 @@ class ProcessX(tk.Tk):
         style.map("AM.Treeview",
                   background=[("selected", SEL_BG)],
                   foreground=[("selected", TEXT)])
-        # remove focus ring / border on proc_tree
         self.proc_tree.configure(takefocus=0)
         style.configure("AM.Treeview", highlightthickness=0, borderwidth=0)
         self.tree.tag_configure("alt",         background=ROW_ALT)
@@ -1261,7 +1197,6 @@ class ProcessX(tk.Tk):
 
 
     def _get_running_pids(self) -> dict:
-        # Return {exe_lower: pid} for all currently running EXEs that have a...
         want = set(self.rules.keys())
         result = {}
         for p in psutil.process_iter(["name", "pid"]):
@@ -1276,7 +1211,17 @@ class ProcessX(tk.Tk):
     def _aff_str(self, aff):
         if not aff or len(set(aff)) >= CPU_COUNT:
             return "all"
-        return ",".join(str(c) for c in sorted(aff))
+        cpus = sorted(set(aff))
+        ranges = []
+        start = prev = cpus[0]
+        for c in cpus[1:]:
+            if c == prev + 1:
+                prev = c
+                continue
+            ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
+            start = prev = c
+        ranges.append(f"{start}-{prev}" if start != prev else f"{start}")
+        return ",".join(ranges)
 
     def _refresh_rules_list(self):
         sel = self.tree.focus()
@@ -1325,12 +1270,6 @@ class ProcessX(tk.Tk):
             self.tree.selection_set(restore_id)
 
     def _auto_refresh(self):
-        # Runs once at startup, and again whenever "Refresh" is clicked -
-        # no longer reschedules itself, so there's no periodic background
-        # cost. The actual process/priority/affinity data collection (the
-        # syscall-heavy part) happens on a worker thread via
-        # _auto_refresh_worker; only the fast Treeview render happens here
-        # on the UI thread once that data comes back.
         self._refresh_rules_list()
         has_open_dropdown = any(
             self.proc_tree.item(iid, "open")
@@ -1339,10 +1278,12 @@ class ProcessX(tk.Tk):
         if not has_open_dropdown:
             threading.Thread(target=self._auto_refresh_worker, daemon=True).start()
 
+        if self.state() != "withdrawn":
+            self._refresh_job = self.after(2000, self._auto_refresh)
+        else:
+            self._refresh_job = None
+
     def _auto_refresh_worker(self):
-        # Background thread: collect the snapshot (no Tkinter calls allowed
-        # here), then hand it to the UI thread via self.after(0, ...) - the
-        # only thread-safe way to touch widgets from outside the main loop.
         try:
             snapshot = self._collect_proc_snapshot()
         except Exception:
@@ -1350,13 +1291,6 @@ class ProcessX(tk.Tk):
         self.after(0, self._refresh_proc_list, snapshot)
 
     def _on_watcher_rule_applied(self):
-        # Called directly from the rule-watcher thread the moment it
-        # auto-applies a saved rule to a newly launched process (e.g.
-        # cs2.exe starting). We're already off the main thread here, so
-        # it's safe to collect the snapshot right away - only the final
-        # render gets handed to the UI thread via self.after. This means
-        # the list catches up immediately on real events, without any
-        # periodic polling in between.
         try:
             snapshot = self._collect_proc_snapshot()
         except Exception:
@@ -1368,22 +1302,14 @@ class ProcessX(tk.Tk):
         self._refresh_proc_list(snapshot)
 
     def _clear_proc_selection(self, event):
-        # Clicking empty space below/between rows clears the selection,
         if not self.proc_tree.identify_row(event.y):
             self.proc_tree.selection_remove(*self.proc_tree.selection())
             self.proc_tree.focus("")
 
     def _clear_proc_selection_key(self, event=None):
-        # Escape always clears the selection, regardless of pointer position.
         self.proc_tree.selection_remove(*self.proc_tree.selection())
         self.proc_tree.focus("")
 
-    # Per-pid cache for the two expensive WinAPI/ctypes lookups below.
-    # Both require an OpenProcess/query/CloseHandle round trip (or a full
-    # CPU-set syscall), so re-running them for every process on every 2s
-    # refresh is the single biggest source of CPU spikes. A short TTL means
-    # they're recomputed every ~6s instead of every ~2s (3x fewer calls)
-    # while still staying reasonably fresh for display purposes.
     _IO_PRI_TTL  = 6.0
     _AFF_TTL     = 6.0
 
@@ -1442,11 +1368,6 @@ class ProcessX(tk.Tk):
         return f"{pct:.1f}%"
 
     def _collect_proc_snapshot(self):
-        # Gathers every process/priority/I-O/affinity value needed to render
-        # the tree. Deliberately contains ZERO Tkinter calls, so it's safe to
-        # run on a background thread (see _auto_refresh) - this is where all
-        # the syscall/ctypes-heavy work lives, kept off the UI thread so it
-        # can't block mouse/window responsiveness while it runs.
         from collections import defaultdict, Counter
 
         _priority_name    = self._priority_name
@@ -1462,16 +1383,11 @@ class ProcessX(tk.Tk):
                     name = (info["name"] or "").strip()
                     if not name:
                         continue
-                    # Task Manager's "Memory" column reports the process's
-                    # private working set (USS), not raw RSS. USS costs an
-                    # extra per-process page-walk query, but matches what
-                    # users expect to see compared against Task Manager.
                     try:
                         ram = p.memory_full_info().uss
                     except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
                         ram = info["memory_info"].rss if info["memory_info"] else 0
                     nice = info["nice"]
-                    # "System Idle Process" is a bookkeeping placeholder, not a real
                     if name.lower() == "system idle process":
                         cpu = 0.0
                     else:
@@ -1549,15 +1465,9 @@ class ProcessX(tk.Tk):
         return snapshot
 
     def _refresh_proc_list(self, snapshot=None):
-        # Main-thread-only: renders a pre-collected snapshot into the
-        # Treeview. Fast - no syscalls, just widget updates - so even though
-        # it still does a full delete+rebuild, it no longer blocks the UI
-        # for long enough to cause mouse stutter. If called with no snapshot
-        # (rare direct calls), it collects synchronously as a fallback.
         if snapshot is None:
             snapshot = self._collect_proc_snapshot()
 
-        # ── preserve open groups and selection
         currently_open = set()
         for iid in self.proc_tree.get_children():
             if self.proc_tree.item(iid, "open"):
@@ -1572,7 +1482,6 @@ class ProcessX(tk.Tk):
             except Exception:
                 pass
 
-        # ── rebuild
         self.proc_tree.delete(*self.proc_tree.get_children())
         restore_iid = None
 
@@ -1609,7 +1518,6 @@ class ProcessX(tk.Tk):
         self._open_groups = currently_open
 
     def _proc_tree_double_click(self, event):
-        # Double-clicking a process row opens the rule editor for that EXE.
         iid = self.proc_tree.identify_row(event.y)
         if not iid:
             return "break"
@@ -1621,11 +1529,9 @@ class ProcessX(tk.Tk):
             pass
         return "break"
 
-    # Kernel pseudo-processes that have no backing EXE on disk, so there's
     _NO_EXE_PROCESSES = {"system", "system idle process", "registry"}
 
     def _render_hicon(self, hicon, size: int) -> object:
-        # Render a Windows HICON into a size x size tk.PhotoImage on the same
         try:
             SIZE    = size
             user32  = ctypes.windll.user32
@@ -1658,16 +1564,15 @@ class ProcessX(tk.Tk):
                                                  ctypes.byref(ppvBits), None, 0)
             old_bm = gdi32.SelectObject(hdc_mem, hbm_dib)
 
-            # clear to background colour (0x1a1a1a)
             class RECT(ctypes.Structure):
                 _fields_ = [("left",ctypes.c_long),("top",ctypes.c_long),
                              ("right",ctypes.c_long),("bottom",ctypes.c_long)]
-            hbr = gdi32.CreateSolidBrush(0x001a1a1a)   # COLORREF is BGR
+            hbr = gdi32.CreateSolidBrush(0x001a1a1a)
             rc  = RECT(0, 0, SIZE, SIZE)
             user32.FillRect(hdc_mem, ctypes.byref(rc), hbr)
             gdi32.DeleteObject(hbr)
 
-            user32.DrawIconEx(hdc_mem, 0, 0, hicon, SIZE, SIZE, 0, None, 3)  # DI_NORMAL
+            user32.DrawIconEx(hdc_mem, 0, 0, hicon, SIZE, SIZE, 0, None, 3)
             gdi32.GdiFlush()
 
             raw_buf = (ctypes.c_ubyte * (SIZE * SIZE * 4))()
@@ -1679,7 +1584,6 @@ class ProcessX(tk.Tk):
             user32.ReleaseDC(None, hdc_screen)
             user32.DestroyIcon(hicon)
 
-            # BGRA → PIL → PNG → tk.PhotoImage
             from PIL import Image as _PILImg
             pil_img = _PILImg.frombytes("RGBA", (SIZE, SIZE), bytes(raw_buf), "raw", "BGRA")
             bg      = _PILImg.new("RGBA", (SIZE, SIZE), (26, 26, 26, 255))
@@ -1692,7 +1596,6 @@ class ProcessX(tk.Tk):
             return None
 
     def _get_default_icon(self, size: int = 16) -> object:
-        # Return (and cache) a size x size PhotoImage of the ProcessX logo, r...
         key = "__default__" if size == 16 else f"__default__@{size}"
         if key in self._icon_cache:
             return self._icon_cache[key]
@@ -1714,7 +1617,6 @@ class ProcessX(tk.Tk):
         return img
 
     def _get_generic_exe_icon(self, size: int = 16) -> object:
-        # Return (and cache) the plain Windows "unknown program" icon — the
         key = "__generic_exe__" if size == 16 else f"__generic_exe__@{size}"
         if key in self._icon_cache:
             return self._icon_cache[key]
@@ -1737,7 +1639,6 @@ class ProcessX(tk.Tk):
                              ("szDisplayName",ctypes.c_wchar * 260),
                              ("szTypeName",   ctypes.c_wchar * 80)]
             shfi = SHFILEINFOW()
-            # A path that doesn't need to exist — USEFILEATTRIBUTES makes
             ret = shell32.SHGetFileInfoW(
                 "processx_generic_placeholder.exe", FILE_ATTRIBUTE_NORMAL,
                 ctypes.byref(shfi), ctypes.sizeof(shfi), shgfi_flags)
@@ -1750,14 +1651,12 @@ class ProcessX(tk.Tk):
 
     def _get_exe_icon(self, name: str, size: int = 16, use_logo_fallback: bool = False,
                        exe_path_hint: str = None) -> object:
-        # Return a size x size PhotoImage for the EXE via DrawIconEx+PIL. Cac...
         key = name.lower() if size == 16 else f"{name.lower()}@{size}"
 
         if key in self._icon_cache:
             return self._icon_cache[key]
 
         def _fallback():
-            # Not cached under `key` on purpose: if the exe isn't found yet
             return self._get_default_icon(size) if use_logo_fallback else self._get_generic_exe_icon(size)
 
         if name.lower() in self._NO_EXE_PROCESSES:
@@ -1765,7 +1664,6 @@ class ProcessX(tk.Tk):
 
         img = None
         try:
-            # locate EXE on disk
             exe_path = None
             for p in psutil.process_iter(["name", "exe"]):
                 try:
@@ -1775,7 +1673,6 @@ class ProcessX(tk.Tk):
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
             if not exe_path and exe_path_hint:
-                # Not currently running, but we've seen this EXE run before
                 try:
                     if os.path.isfile(exe_path_hint):
                         exe_path = exe_path_hint
@@ -1787,7 +1684,6 @@ class ProcessX(tk.Tk):
             SIZE    = size
             shell32 = ctypes.windll.shell32
 
-            # get HICON — small (16px source) for compact rows, large (32px source)
             SHGFI_ICON       = 0x100
             SHGFI_LARGEICON  = 0x000000000
             SHGFI_SMALLICON  = 0x000000001
@@ -1822,10 +1718,6 @@ class ProcessX(tk.Tk):
 
 
     def _open_add_rule(self):
-        # Prompt for an EXE name, then open the editor for it. Lets people
-        # prepare a rule for a game/app they haven't installed yet - it'll
-        # sit ready in Rules and the watcher will apply it the moment that
-        # exe actually launches for the first time.
         dlg = _ExeNameDialog(self)
         self.wait_window(dlg)
         exe_name = dlg.result
@@ -1836,7 +1728,6 @@ class ProcessX(tk.Tk):
 
 
     def _open_editor_for_exe(self, exe_name: str):
-        # Open the rule editor for the given EXE name (used from proc list do...
         proc = None
         for p in psutil.process_iter(["name", "pid"]):
             try:
@@ -1845,7 +1736,7 @@ class ProcessX(tk.Tk):
                     break
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 pass
-        EditorDialog(self, proc=proc, proc_name=exe_name, rules=self.rules)
+        return EditorDialog(self, proc=proc, proc_name=exe_name, rules=self.rules)
 
     def _open_editor_for_selected(self):
         sel = self.tree.focus()
@@ -1855,13 +1746,12 @@ class ProcessX(tk.Tk):
         self._open_editor_for_exe(exe_name)
 
     def _open_rules_window(self):
-        # Open a Toplevel showing all saved rules with delete + close buttons.
         win = tk.Toplevel(self, bg=BG)
         win.title("Rules")
         win.geometry("800x420")
         win.resizable(True, True)
         win.grab_set()
-        win.update_idletasks()   # forces the real HWND to exist
+        win.update_idletasks()
         _win_enable_dark_titlebar(win)
 
         cols = ("exe", "priority", "io", "affinity", "status")
@@ -1918,9 +1808,20 @@ class ProcessX(tk.Tk):
 
         _populate()
 
+        def _edit():
+            sel = tree.focus()
+            if not sel:
+                messagebox.showinfo("Edit Rule", "Select a rule to edit.")
+                return
+            exe_name = str(tree.item(sel)["values"][0])
+            dlg = self._open_editor_for_exe(exe_name)
+            win.wait_window(dlg)
+            _populate()
+
         def _delete():
             sel = tree.focus()
             if not sel:
+                messagebox.showinfo("Delete Rule", "Select a rule to delete.")
                 return
             exe_name = str(tree.item(sel)["values"][0])
             key = exe_name.lower()
@@ -2004,6 +1905,7 @@ class ProcessX(tk.Tk):
         inner.pack(anchor="center")
         self._btn(inner, "Import Rules", _import).pack(side="left", padx=6)
         self._btn(inner, "Export Rules", _export).pack(side="left", padx=6)
+        self._btn(inner, "Edit Rule",    _edit).pack(side="left", padx=6)
         self._btn(inner, "Delete Rule",  _delete).pack(side="left", padx=6)
         self._btn(inner, "Close",        win.destroy).pack(side="left", padx=6)
 
@@ -2048,7 +1950,6 @@ class ProcessX(tk.Tk):
 
 
     def _start_tray(self):
-        # Create and run the system tray icon on a dedicated daemon thread.
         if not _TRAY_AVAILABLE:
             self.status_var.set("Tray unavailable — install pystray and Pillow: pip install pystray pillow")
             return
@@ -2071,32 +1972,31 @@ class ProcessX(tk.Tk):
         t.start()
 
     def _tray_show(self, icon=None, item=None):
-        # Restore the window from tray.
         self.after(0, self._show_window)
 
     def _show_window(self):
         self.deiconify()
         self.lift()
         self.focus_force()
+        if self._refresh_job is None:
+            self._auto_refresh()
 
     def _tray_quit(self, icon=None, item=None):
-        # Quit completely from tray menu.
         if self._tray_icon:
             self._tray_icon.stop()
         self.after(0, self.destroy)
 
     def _on_close(self):
-        # Minimise to tray on window close, or quit if tray unavailable.
         if _TRAY_AVAILABLE and self._tray_icon:
+            if self._refresh_job is not None:
+                self.after_cancel(self._refresh_job)
+                self._refresh_job = None
             self.withdraw()
         else:
             self.destroy()
 
 
 class _ExeNameDialog(tk.Toplevel):
-    # Simple prompt: type an EXE name (e.g. game.exe) to create a new rule
-    # for something that isn't running yet - or may not even be installed
-    # yet - so the rule is ready and waiting the first time it launches.
     def __init__(self, parent):
         super().__init__(parent)
         self.result = None
@@ -2107,7 +2007,7 @@ class _ExeNameDialog(tk.Toplevel):
         w, h = 360, 150
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         self.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
-        self.update_idletasks()   # forces the real HWND to exist
+        self.update_idletasks()
         _win_enable_dark_titlebar(self)
         self._build()
 
@@ -2164,7 +2064,7 @@ class EditorDialog(tk.Toplevel):
         y  = (sh - h) // 2
         self.geometry(f"{w}x{h}+{x}+{y}")
         self.minsize(820, 560)
-        self.update_idletasks()   # forces the real HWND to exist
+        self.update_idletasks()
         _win_enable_dark_titlebar(self)
         existing = rules.get(proc_name.lower(), {})
         self._build(existing)
@@ -2260,17 +2160,8 @@ class EditorDialog(tk.Toplevel):
                 v.set(True)
 
         def _ht_off():
-            # P-core threads come in pairs (thread 0, thread 1 of the same
-            # physical core); E-cores have no second thread, so they stay
-            # fully enabled regardless of HT state.
             core_map = CPU_TOPOLOGY.get("core_map")
             if core_map:
-                # Clustered-layout-aware: pair up P-core indices in the
-                # order they appear (not assuming they're contiguous), then
-                # disable the second half of each pair. For a contiguous
-                # layout this reduces to the exact same even/odd split as
-                # the boundary-based branch below - so 12th/13th/14th gen
-                # behave identically either way.
                 p_indices = [i for i, is_e in enumerate(core_map) if not is_e]
                 disable = set(p_indices[j] for j in range(1, len(p_indices), 2))
                 for i, v in enumerate(self.aff_vars):
@@ -2302,7 +2193,7 @@ class EditorDialog(tk.Toplevel):
             core_map = CPU_TOPOLOGY.get("core_map")
             if core_map:
                 for i, v in enumerate(self.aff_vars):
-                    v.set(not core_map[i])   # keep P-cores on, turn E-cores off
+                    v.set(not core_map[i])
                 return
 
             e_start = CPU_TOPOLOGY["e_thread_start"]
@@ -2321,7 +2212,7 @@ class EditorDialog(tk.Toplevel):
             core_map = CPU_TOPOLOGY.get("core_map")
             if core_map:
                 for i, v in enumerate(self.aff_vars):
-                    v.set(core_map[i])   # keep E-cores on, turn P-cores off
+                    v.set(core_map[i])
                 return
 
             e_start = CPU_TOPOLOGY["e_thread_start"]
@@ -2398,7 +2289,6 @@ class EditorDialog(tk.Toplevel):
         rule["io_priority"] = self.io_var.get()
         rule["affinity"]    = aff
 
-        # Keep (or, if the game happens to be running right now, refresh) the
         old_rule = self.rules.get(self.proc_name.lower(), {})
         exe_path = old_rule.get("exe_path")
         for p in psutil.process_iter(["name", "exe"]):
@@ -2414,7 +2304,6 @@ class EditorDialog(tk.Toplevel):
         self.rules[self.proc_name.lower()] = rule
         save_rules(self.rules)
 
-        # Apply to every currently running instance of this EXE, not just the
         applied_any  = False
         instance_ct  = 0
         all_msgs     = []
@@ -2457,7 +2346,6 @@ class EditorDialog(tk.Toplevel):
 
 
 def _acquire_single_instance_mutex() -> object:
-    # Create a named kernel mutex. Returns the handle on success (first i...
     MUTEX_NAME = "Global\\ProcessX_SingleInstance_jadenpeek"
     ERROR_ALREADY_EXISTS = 183
 
