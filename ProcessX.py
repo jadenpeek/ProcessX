@@ -12,6 +12,8 @@ import threading
 import time
 import base64
 import io
+import re
+import atexit
 from pathlib import Path
 
 try:
@@ -428,6 +430,12 @@ def _rule_watcher_loop(get_rules_fn):
                                 newly_applied.append(exe)
                             except Exception:
                                 pass
+                            pp_guid = rules[exe].get("power_plan")
+                            if pp_guid:
+                                try:
+                                    _power_plan_manager.on_process_seen(exe, pp_guid)
+                                except Exception:
+                                    pass
                     last_pids[exe] = current_pids
 
                     if procs and not rules[exe].get("exe_path"):
@@ -442,6 +450,12 @@ def _rule_watcher_loop(get_rules_fn):
                     if exe not in found:
                         exited.append(exe)
                         del last_pids[exe]
+
+                for exe in exited:
+                    try:
+                        _power_plan_manager.on_process_gone(exe)
+                    except Exception:
+                        pass
 
                 if paths_updated:
                     try:
@@ -764,6 +778,172 @@ def get_effective_cpu_sets(pid: int) -> list:
         return []
 
 
+_GUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+def _looks_like_guid(s) -> bool:
+    return isinstance(s, str) and bool(_GUID_RE.match(s.strip()))
+
+
+def _pp_log(msg: str):
+    # Lightweight console logging for Power Plan events. Never allowed to
+    # raise - a frozen/no-console build can make stdout unusable.
+    try:
+        print(f"[PowerPlan] {msg}")
+    except Exception:
+        pass
+
+
+def list_power_plans() -> list:
+    # Ask Windows for every installed Power Plan via `powercfg /list`.
+    # Returns [(name, guid, is_active), ...], or [] if powercfg is missing
+    # or its output couldn't be parsed. Never hardcode plan names/GUIDs here -
+    # different Windows installs (and OEM images) ship different plans.
+    try:
+        r = subprocess.run(
+            ["powercfg", "/list"],
+            capture_output=True, text=True, creationflags=0x08000000,
+        )
+    except Exception as e:
+        _pp_log(f"powercfg /list failed: {e}")
+        return []
+
+    plans = []
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if not line.lower().startswith("power scheme"):
+            continue
+        try:
+            after = line.split(":", 1)[1].strip()
+            is_active = after.endswith("*")
+            after = after.rstrip("*").strip()
+            guid, _, rest = after.partition("(")
+            guid = guid.strip()
+            name = rest.rsplit(")", 1)[0].strip() if "(" in after else guid
+            if _looks_like_guid(guid):
+                plans.append((name or guid, guid, is_active))
+        except Exception:
+            continue
+    return plans
+
+
+def get_active_power_plan_guid() -> "str | None":
+    # Cheaper than list_power_plans() when we only need the current plan.
+    try:
+        r = subprocess.run(
+            ["powercfg", "/getactivescheme"],
+            capture_output=True, text=True, creationflags=0x08000000,
+        )
+    except Exception as e:
+        _pp_log(f"powercfg /getactivescheme failed: {e}")
+        return None
+    for line in r.stdout.splitlines():
+        line = line.strip()
+        if line.lower().startswith("power scheme guid"):
+            guid = line.split(":", 1)[1].strip().split("(")[0].strip()
+            return guid if _looks_like_guid(guid) else None
+    return None
+
+
+def set_active_power_plan(guid: str) -> tuple:
+    # Activate a Power Plan by GUID via `powercfg /setactive`.
+    if not _looks_like_guid(guid):
+        return (False, f"invalid GUID: {guid!r}")
+    try:
+        r = subprocess.run(
+            ["powercfg", "/setactive", guid],
+            capture_output=True, text=True, creationflags=0x08000000,
+        )
+        if r.returncode == 0:
+            return (True, "OK")
+        return (False, (r.stderr or r.stdout or f"exit code {r.returncode}").strip())
+    except Exception as e:
+        return (False, str(e))
+
+
+class PowerPlanManager:
+    # Windows Power Plans are system-wide, NOT per-process (see README /
+    # EditorDialog note). This class is the single place that decides which
+    # Power Plan rule "wins" when several managed processes are running at
+    # once, so a process rule never fights another process rule over the
+    # one active system Power Plan.
+    #
+    # Ownership model: every process with a power_plan rule that is
+    # currently running is a "controller". The most-recently-launched
+    # controller's plan is the one that gets activated. When a controller
+    # exits, control falls back to whichever other controller is still
+    # running (if any); once none remain, the plan that was active before
+    # ProcessX started touching anything is restored.
+    def __init__(self):
+        self._lock          = threading.Lock()
+        self._original_guid = None   # captured lazily, on first acquire
+        self._controllers   = []     # [(exe_lower, guid), ...] oldest -> newest
+
+    def on_process_seen(self, exe: str, guid: str):
+        # `exe` (lowercased) just started and carries a valid power_plan rule.
+        if not _looks_like_guid(guid):
+            return
+        with self._lock:
+            if self._original_guid is None:
+                self._original_guid = get_active_power_plan_guid()
+            self._controllers = [c for c in self._controllers if c[0] != exe]
+            self._controllers.append((exe, guid))
+            self._activate_locked(guid)
+
+    def on_process_gone(self, exe: str):
+        # All instances of `exe` have exited (or its rule no longer wants a
+        # Power Plan) - drop it from the controller stack and hand control
+        # to whichever managed process is still running, if any.
+        with self._lock:
+            before = len(self._controllers)
+            self._controllers = [c for c in self._controllers if c[0] != exe]
+            if len(self._controllers) == before:
+                return   # wasn't a controller - nothing to do
+            if self._controllers:
+                self._activate_locked(self._controllers[-1][1])
+            else:
+                self._restore_original_locked()
+
+    def shutdown_restore(self):
+        # Called on clean ProcessX shutdown: give back whatever plan was
+        # active before we started managing anything, if we ever changed it.
+        # Safe to call even if we never touched the Power Plan (no-op then).
+        with self._lock:
+            if self._original_guid is not None:
+                self._restore_original_locked()
+            self._controllers = []
+
+    def _activate_locked(self, guid):
+        # Only ever calls `powercfg /setactive` when the requested plan
+        # differs from what's *actually* active right now (queried fresh,
+        # so we don't fight anything the user or another tool changed).
+        current = get_active_power_plan_guid()
+        if current and current.lower() == guid.lower():
+            return
+        ok, err = set_active_power_plan(guid)
+        if ok:
+            _pp_log(f"Switched active Power Plan to {guid}")
+        else:
+            _pp_log(f"Failed to activate Power Plan: GUID={guid} Error={err}")
+
+    def _restore_original_locked(self):
+        guid = self._original_guid
+        if not guid:
+            return
+        current = get_active_power_plan_guid()
+        if current and current.lower() == guid.lower():
+            return
+        ok, err = set_active_power_plan(guid)
+        if ok:
+            _pp_log(f"Restored original Power Plan {guid}")
+        else:
+            _pp_log(f"Failed to restore original Power Plan: GUID={guid} Error={err}")
+
+
+_power_plan_manager = PowerPlanManager()
+atexit.register(_power_plan_manager.shutdown_restore)
+
+
 def load_rules() -> dict:
     if CONFIG_FILE.exists():
         try:
@@ -806,8 +986,17 @@ def _validate_rules_data(data) -> tuple:
             else:
                 warnings.append(f"'{exe}': ignored invalid affinity list.")
 
+        if "power_plan" in rule:
+            pp = rule["power_plan"]
+            if pp is None:
+                pass   # explicit "no Power Plan rule" - fine to just omit it
+            elif _looks_like_guid(pp):
+                clean_rule["power_plan"] = pp
+            else:
+                warnings.append(f"'{exe}': ignored invalid power_plan (expected a GUID).")
+
         if not clean_rule:
-            warnings.append(f"Skipped '{exe}': no recognizable rule fields (priority/io_priority/affinity).")
+            warnings.append(f"Skipped '{exe}': no recognizable rule fields (priority/io_priority/affinity/power_plan).")
             continue
 
         if "exe_path" in rule and isinstance(rule["exe_path"], str):
@@ -1183,6 +1372,18 @@ class ProcessX(tk.Tk):
         style.map("AM.Vertical.TScrollbar",
                   background=[("active", "#4a4a4a"), ("pressed", "#4a4a4a")],
                   arrowcolor=[("active", TEXT), ("pressed", TEXT)])
+        style.configure("AM.TCombobox",
+                        fieldbackground=BTN_BG, background=BTN_BG, foreground=TEXT,
+                        arrowcolor=TEXT, bordercolor=BORDER, lightcolor=BTN_BG,
+                        darkcolor=BTN_BG, selectbackground=BTN_BG, selectforeground=TEXT)
+        style.map("AM.TCombobox",
+                  fieldbackground=[("readonly", BTN_BG), ("!readonly", BTN_BG)],
+                  foreground=[("readonly", TEXT)],
+                  background=[("readonly", BTN_BG)])
+        self.option_add("*TCombobox*Listbox.background", BTN_BG)
+        self.option_add("*TCombobox*Listbox.foreground", TEXT)
+        self.option_add("*TCombobox*Listbox.selectBackground", SEL_BG)
+        self.option_add("*TCombobox*Listbox.selectForeground", TEXT)
         style.layout("AM.Treeview", [
             ("AM.Treeview.treearea", {"sticky": "nswe"})
         ])
@@ -1748,23 +1949,24 @@ class ProcessX(tk.Tk):
     def _open_rules_window(self):
         win = tk.Toplevel(self, bg=BG)
         win.title("Rules")
-        win.geometry("800x420")
+        win.geometry("940x420")
         win.resizable(True, True)
         win.grab_set()
         win.update_idletasks()
         _win_enable_dark_titlebar(win)
 
-        cols = ("exe", "priority", "io", "affinity", "status")
+        cols = ("exe", "priority", "io", "affinity", "power_plan", "status")
         tree = ttk.Treeview(win, columns=cols, show="tree headings",
                             selectmode="browse", style="AM.Treeview")
         tree.column("#0", width=40, minwidth=40, stretch=False)
         tree.heading("#0", text="")
         col_cfg = [
-            ("exe",      "EXE Name",     200, "w"),
-            ("priority", "CPU Priority", 115, "center"),
-            ("io",       "I/O Priority", 100, "center"),
-            ("affinity", "CPU Sets",     215, "center"),
-            ("status",   "Status",       110, "center"),
+            ("exe",        "EXE Name",     200, "w"),
+            ("priority",   "CPU Priority", 115, "center"),
+            ("io",         "I/O Priority", 100, "center"),
+            ("affinity",   "CPU Sets",     215, "center"),
+            ("power_plan", "Power Plan",   150, "center"),
+            ("status",     "Status",       110, "center"),
         ]
         for col, label, width, anchor in col_cfg:
             tree.heading(col, text=label, anchor=anchor)
@@ -1781,14 +1983,17 @@ class ProcessX(tk.Tk):
 
         def _populate():
             running = self._get_running_pids()
+            plan_name_by_guid = {guid.lower(): name for name, guid, _active in list_power_plans()}
             rows = []
             for exe, rule in self.rules.items():
                 aff   = rule.get("affinity", [])
                 aff_s = self._aff_str(aff)
                 io_n  = IO_PRIORITY_NAMES[rule["io_priority"]] if "io_priority" in rule else "Not Specified"
                 pri   = rule.get("priority", "Normal")
+                pp_guid = rule.get("power_plan")
+                pp_n  = plan_name_by_guid.get(pp_guid.lower(), pp_guid) if pp_guid else "Follow Current"
                 status = "● Running" if exe in running else "○ Waiting"
-                rows.append((exe, pri, io_n, aff_s, status))
+                rows.append((exe, pri, io_n, aff_s, pp_n, status))
             rows.sort(key=lambda x: x[0].lower())
             tree.delete(*tree.get_children())
             for i, row in enumerate(rows):
@@ -1829,6 +2034,7 @@ class ProcessX(tk.Tk):
                 del self.rules[key]
                 save_rules(self.rules)
                 revert_running_instances(exe_name)
+                _power_plan_manager.on_process_gone(key)
                 self.status_var.set(f"Rule deleted for {exe_name} — reverted to defaults")
                 _populate()
 
@@ -1984,6 +2190,7 @@ class ProcessX(tk.Tk):
     def _tray_quit(self, icon=None, item=None):
         if self._tray_icon:
             self._tray_icon.stop()
+        _power_plan_manager.shutdown_restore()
         self.after(0, self.destroy)
 
     def _on_close(self):
@@ -1993,6 +2200,7 @@ class ProcessX(tk.Tk):
                 self._refresh_job = None
             self.withdraw()
         else:
+            _power_plan_manager.shutdown_restore()
             self.destroy()
 
 
@@ -2261,6 +2469,66 @@ class EditorDialog(tk.Toplevel):
 
         tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=16, pady=8)
 
+
+        self._lbl("Power Plan")
+        pp_row = tk.Frame(self, bg=BG)
+        pp_row.pack(anchor="w", padx=24, pady=2)
+
+        FOLLOW_CURRENT = "Follow Current"
+        self._pp_guid_by_name = {FOLLOW_CURRENT: None}
+        pp_names = [FOLLOW_CURRENT]
+        for name, guid, _active in list_power_plans():
+            self._pp_guid_by_name[name] = guid
+            pp_names.append(name)
+
+        saved_guid = existing.get("power_plan")
+        saved_name = FOLLOW_CURRENT
+        if saved_guid:
+            for name, guid in self._pp_guid_by_name.items():
+                if guid and guid.lower() == saved_guid.lower():
+                    saved_name = name
+                    break
+            else:
+                # The rule points at a GUID that no longer exists on this
+                # system (plan renamed/deleted). Keep it visible instead of
+                # silently dropping the user's saved choice.
+                saved_name = f"Unknown Plan ({saved_guid})"
+                self._pp_guid_by_name[saved_name] = saved_guid
+                pp_names.append(saved_name)
+
+        self.pp_var   = tk.StringVar(value=saved_name)
+        self.pp_combo = ttk.Combobox(
+            pp_row, textvariable=self.pp_var, values=pp_names,
+            state="readonly", width=28, style="AM.TCombobox",
+            font=(FONT, 10, "bold"))
+        self.pp_combo.pack(side="left")
+
+        def _refresh_plans():
+            current = self.pp_var.get()
+            names = [FOLLOW_CURRENT]
+            self._pp_guid_by_name = {FOLLOW_CURRENT: None}
+            for name, guid, _active in list_power_plans():
+                self._pp_guid_by_name[name] = guid
+                names.append(name)
+            if current not in self._pp_guid_by_name and current != FOLLOW_CURRENT:
+                names.append(current)   # keep the current selection visible
+                self._pp_guid_by_name[current] = self._pp_guid_by_name.get(current)
+            self.pp_combo["values"] = names
+
+        tk.Button(pp_row, text="\u21bb", command=_refresh_plans,
+                  font=(FONT, 9, "bold"), bg=BTN_BG, fg=BTN_FG,
+                  relief="flat", padx=8, pady=2,
+                  activebackground="#4a4a4a").pack(side="left", padx=(6, 0))
+
+        tk.Label(self,
+                 text="Power Plans are system-wide in Windows, not truly per-process.\n"
+                      "ProcessX activates it while this EXE is running and restores the\n"
+                      "previous plan once no managed process needs it anymore.",
+                 font=(FONT, 8), fg=TEXT_DIM, bg=BG, justify="left").pack(
+            anchor="w", padx=24, pady=(4, 0))
+
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x", padx=16, pady=8)
+
         btn_row = tk.Frame(self, bg=BG)
         btn_row.pack(pady=4)
         for label, cmd in [
@@ -2288,6 +2556,9 @@ class EditorDialog(tk.Toplevel):
         rule["priority"]    = self.pri_var.get()
         rule["io_priority"] = self.io_var.get()
         rule["affinity"]    = aff
+        pp_guid = self._pp_guid_by_name.get(self.pp_var.get())
+        if pp_guid:
+            rule["power_plan"] = pp_guid
 
         old_rule = self.rules.get(self.proc_name.lower(), {})
         exe_path = old_rule.get("exe_path")
@@ -2326,6 +2597,10 @@ class EditorDialog(tk.Toplevel):
             if any_failed:
                 summary += " (some failed)"
             self.result_lbl.config(text=summary + ":  " + "  |  ".join(dict.fromkeys(all_msgs)))
+            if pp_guid:
+                _power_plan_manager.on_process_seen(self.proc_name.lower(), pp_guid)
+            else:
+                _power_plan_manager.on_process_gone(self.proc_name.lower())
         else:
             self.result_lbl.config(text="Saved — will apply automatically when the EXE starts.")
 
@@ -2339,6 +2614,7 @@ class EditorDialog(tk.Toplevel):
             del self.rules[key]
             save_rules(self.rules)
             revert_running_instances(self.proc_name)
+            _power_plan_manager.on_process_gone(key)
             self.parent.status_var.set(f"Rule deleted for {self.proc_name} — reverted to defaults")
         self.destroy()
         self.parent._refresh_rules_list()
