@@ -24,7 +24,7 @@ Grab the latest `ProcessX.exe` from the [Releases](../../releases) page. There's
 2. Double-click a process in the list, or press **Add Rule** and type an exe name like `game.exe`.
 3. Choose the priorities and the CPUs, then press **Apply & Save**.
 
-The rule is saved by exe name and applied every time that program starts. ProcessX has to be running for that (the tray is fine), because a small background watcher is what catches new programs as they launch.
+ProcessX has to be running for that (the tray is fine), because a small background watcher is what catches new programs as they launch.
 
 ## Task Manager won't show your CPU Sets
 
